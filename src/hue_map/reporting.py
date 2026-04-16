@@ -143,6 +143,8 @@ def _render_row(result: dict[str, Any]) -> str:
     primary_refs = primary.get("matched_reference_paths", []) if primary else []
     primary_uri = _encode_image_data_uri(primary_refs[0]) if primary_refs else ""
     predicted_name = html.escape(str(primary.get("item", "?") or "?"))
+    count_badge_html = _render_count_badge(result.get("stack_count"))
+    count_preview_html = _render_count_preview(result.get("stack_count"))
 
     # Empty slots don't really have a prediction, so collapse the prediction
     # and runners-up columns to a simple placeholder for readability.
@@ -182,14 +184,62 @@ def _render_row(result: dict[str, Any]) -> str:
         <td class="pos">r{result['row']}&thinsp;c{result['col']}<br>#{result['slot_index']:03d}</td>
         <td class="slot"><img class="slot-img" src="{slot_uri}" alt="slot {result['slot_index']}"></td>
         <td class="pred">
-          <div class="pred-name">{predicted_name}</div>
+          <div class="pred-name">{predicted_name}{count_badge_html}</div>
           <div class="pred-score">conf {confidence:.3f}</div>
           <div class="pred-gap">gap {gap_text}</div>
+          {count_preview_html}
         </td>
         <td class="ref"><img class="ref-img" src="{primary_uri}" alt="{predicted_name} reference"></td>
         <td class="runners-cell"><div class="runners">{runners_html}</div></td>
       </tr>
     """
+
+
+def _render_count_badge(stack_count: dict[str, Any] | None) -> str:
+    """Return a small inline HTML badge showing the detected stack count.
+
+    - Value read by OCR: solid badge (`x164`).
+    - No number visible but item present: dashed "assumed single" badge
+      (`x1`) so the reader can distinguish default-to-1 from confident OCR.
+    """
+    if not stack_count:
+        return ""
+    value = stack_count.get("value")
+    if value is None:
+        return ""
+    assumed = bool(stack_count.get("assumed_single"))
+    confidence = float(stack_count.get("confidence", 0.0) or 0.0)
+    if assumed:
+        cls = "count-badge count-badge-assumed"
+        title = "No number detected; assumed single item"
+    else:
+        cls = "count-badge"
+        title = f"OCR confidence: {confidence:.0%}"
+    return f' <span class="{cls}" title="{title}">&times;{int(value)}</span>'
+
+
+def _render_count_preview(stack_count: dict[str, Any] | None) -> str:
+    """Render the preprocessed number crop so a human can eyeball what OCR saw.
+
+    The preview is an inline base64 PNG of the binarised number region -
+    white digit pixels on a black background, the exact image that was
+    handed to Tesseract. Shown regardless of whether OCR succeeded so we
+    can debug both classes of failure (OCR misread vs no white pixels).
+    """
+    if not stack_count:
+        return ""
+    image_path = stack_count.get("image_path")
+    if not image_path:
+        return ""
+    uri = _encode_image_data_uri(image_path)
+    if not uri:
+        return ""
+    raw = html.escape(str(stack_count.get("raw_text", "") or ""))
+    pixels = int(stack_count.get("pixel_count", 0) or 0)
+    tooltip = f"OCR input (white px: {pixels}, raw: {raw or '-'})"
+    return (
+        f'<img class="count-preview" src="{uri}" alt="number crop" title="{tooltip}">'
+    )
 
 
 def _confidence_class(confidence: float, gap: float | None) -> str:
@@ -302,6 +352,23 @@ _TEMPLATE = """<!doctype html>
   .pred-red .pred-name {{ color: var(--red); }}
   .pred-empty .pred-name {{ color: var(--muted); font-style: italic; }}
   .pred-empty td.slot img {{ opacity: 0.5; }}
+  .count-badge {{
+    display: inline-block; margin-left: 6px; padding: 1px 7px;
+    border-radius: 10px; background: #2d343c; color: var(--text);
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    font-weight: 600; vertical-align: middle;
+  }}
+  .count-badge-assumed {{
+    background: transparent;
+    border: 1px dashed var(--muted);
+    color: var(--muted); font-weight: 500;
+  }}
+  .count-preview {{
+    display: inline-block; margin-top: 6px;
+    max-width: 120px; max-height: 40px;
+    border: 1px solid var(--border); border-radius: 3px;
+    background: #000; image-rendering: pixelated;
+  }}
   .pred-score, .pred-gap {{ color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }}
   .runners {{ display: flex; gap: 10px; flex-wrap: wrap; }}
   .runner {{ width: 80px; text-align: center; }}
@@ -442,6 +509,23 @@ _COMBINED_TEMPLATE = """<!doctype html>
   .pred-red .pred-name {{ color: var(--red); }}
   .pred-empty .pred-name {{ color: var(--muted); font-style: italic; }}
   .pred-empty td.slot img {{ opacity: 0.5; }}
+  .count-badge {{
+    display: inline-block; margin-left: 6px; padding: 1px 7px;
+    border-radius: 10px; background: #2d343c; color: var(--text);
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    font-weight: 600; vertical-align: middle;
+  }}
+  .count-badge-assumed {{
+    background: transparent;
+    border: 1px dashed var(--muted);
+    color: var(--muted); font-weight: 500;
+  }}
+  .count-preview {{
+    display: inline-block; margin-top: 6px;
+    max-width: 120px; max-height: 40px;
+    border: 1px solid var(--border); border-radius: 3px;
+    background: #000; image-rendering: pixelated;
+  }}
   .pred-score, .pred-gap {{ color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }}
   .runners {{ display: flex; gap: 10px; flex-wrap: wrap; }}
   .runner {{ width: 80px; text-align: center; }}

@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 output/
+output/_transient/
 *.zip
+todo.txt

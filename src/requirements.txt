@@ -3,3 +3,4 @@ opencv-python>=4.8
 pillow>=10.0
 requests>=2.31
 beautifulsoup4>=4.12
+easyocr>=1.7.0
