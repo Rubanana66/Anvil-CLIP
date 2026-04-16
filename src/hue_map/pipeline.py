@@ -57,7 +57,16 @@ def process_screenshot(
 
     slot_crops = slots.detect_and_crop_slots(image, border_fraction=border_fraction)
     if not slot_crops:
-        raise SystemExit(f"No slots detected in {screenshot_path}")
+        # Skip this screenshot but keep processing the rest of the batch.
+        LOGGER.warning("No slots detected in %s; skipping.", screenshot_path)
+        return {
+            "screenshot_path": str(screenshot_path),
+            "output_dir": "",
+            "report_path": "",
+            "results_path": "",
+            "slot_count": 0,
+            "skipped": True,
+        }
 
     run_dir = output_dir / screenshot_path.stem
     slots_dir = run_dir / "slots"

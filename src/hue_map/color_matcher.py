@@ -80,8 +80,20 @@ BACKGROUND_VAL_TOLERANCE = 45      # half-width in value/brightness (0-255)
 # share the slot-bg hue, so HSV masking strips them, leaving just the outline.
 # After initial masking we close the outline and fill any "holes" that are
 # not connected to the image border - those are the item's interior pixels.
-ITEM_CLOSE_KERNEL_FRACTION = 1 / 20   # close-kernel size as fraction of min(h,w)
+# The kernel must be large enough to bridge the gaps in an item's outline
+# (Animal_Shite is essentially a ring of darker pixels around a tan interior,
+# with breaks of several pixels between ring fragments). Too large would
+# merge neighbouring feather strands or knife blades, so we cap at 7.
+ITEM_CLOSE_KERNEL_FRACTION = 1 / 12   # close-kernel size as fraction of min(h,w)
 ITEM_CLOSE_KERNEL_MIN = 3             # minimum odd kernel size
+ITEM_CLOSE_KERNEL_MAX = 7             # maximum odd kernel size
+# Only fill holes that are substantial. Amorphous items like Animal_Shite
+# have one big interior hole (~15-20% of the slot) that should be filled;
+# lattice items like Rope have many small gaps between strands (<5% each)
+# that should NOT be filled - doing so would add slot-bg pixels to the
+# histogram and ruin the match. The threshold is applied PER HOLE so a
+# multi-region item is still filled correctly.
+ITEM_HOLE_MIN_FRACTION = 0.08
 
 # -- empty-slot detection ---------------------------------------------------
 # An empty slot carries nothing but slot background plus a little UI chrome,
@@ -110,7 +122,7 @@ EMPTY_SLOT_MAX_ASPECT_RATIO = 9.0       # longer / shorter side of blob's bbox
 # like Javelin can touch slot corners, but they still keep 15%+ of pixels
 # whereas frame leaks max out around 10%.
 EMPTY_SLOT_FRAME_BBOX_FRACTION = 0.90   # bbox must cover at least 90% of one axis
-EMPTY_SLOT_FRAME_MIN_DENSITY = 0.18     # and the blob must fill < 18% of its bbox
+EMPTY_SLOT_FRAME_MIN_DENSITY = 0.10     # and the blob must fill < 10% of its bbox
 EMPTY_SLOT_FRAME_MAX_TOTAL_FRACTION = 0.12  # and total kept pixels must be < 12%
 
 # -- UI chrome detection ----------------------------------------------------
@@ -302,7 +314,7 @@ def classify_item_crop(
     keep_mask &= alpha >= MIN_ALPHA
     keep_mask &= hsv[..., 2] >= MIN_VALUE
     slot_background = _sample_slot_background(bgr)
-    keep_mask &= ~_is_slot_background_pixel(hsv, slot_background)
+    keep_mask &= ~_border_connected_background(hsv, slot_background)
     keep_mask &= ~_detect_ui_chrome_mask(bgr, hsv)
     keep_mask = _fill_item_interior(keep_mask)
 
@@ -425,13 +437,18 @@ def compute_image_histogram_from_array(
         # per-query so we adapt to screenshots that have slightly different
         # slot tints without any hardcoded colour.
         slot_background = _sample_slot_background(bgr)
-        mask &= ~_is_slot_background_pixel(hsv, slot_background)
+        mask &= ~_border_connected_background(hsv, slot_background)
 
         # UI chrome detection (quality badge, left bar, stack count).
         mask &= ~_detect_ui_chrome_mask(bgr, hsv)
 
-        # Restore interior pixels of amorphous items (Animal_Shite, meat, ...)
-        # whose hue matches slot bg and who would otherwise be hollowed out.
+        # Fallback for amorphous items whose interior is large enough to
+        # be classified as slot-bg BUT doesn't connect to the border
+        # because the outline is continuous enough to enclose it. These
+        # were already kept by the border-connected test above, but the
+        # interior fill still catches the corner case where the outline
+        # closes up well enough for the interior region to be labelled as
+        # bg and we need it back.
         mask = _fill_item_interior(mask)
 
     return _histogram_from_mask(hsv, mask)
@@ -454,7 +471,7 @@ def build_query_keep_mask(bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     keep = np.ones(bgr_array.shape[:2], dtype=bool)
     keep &= hsv[..., 2] >= MIN_VALUE
-    keep &= ~_is_slot_background_pixel(hsv, slot_background)
+    keep &= ~_border_connected_background(hsv, slot_background)
     keep &= ~_detect_ui_chrome_mask(bgr_array, hsv)
     keep = _fill_item_interior(keep)
     return keep, slot_background
@@ -602,7 +619,8 @@ def _fill_item_interior(keep_mask: np.ndarray) -> np.ndarray:
         return keep_mask
 
     # Morphological close: dilate then erode. Odd kernel size so it has a centre.
-    kernel_size = max(ITEM_CLOSE_KERNEL_MIN, int(min(height, width) * ITEM_CLOSE_KERNEL_FRACTION))
+    raw_kernel = int(min(height, width) * ITEM_CLOSE_KERNEL_FRACTION)
+    kernel_size = min(ITEM_CLOSE_KERNEL_MAX, max(ITEM_CLOSE_KERNEL_MIN, raw_kernel))
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
@@ -620,14 +638,69 @@ def _fill_item_interior(keep_mask: np.ndarray) -> np.ndarray:
     border_labels.update(labels[:, 0].tolist())
     border_labels.update(labels[:, -1].tolist())
 
-    # Anything not in that set is an enclosed hole -> restore it.
+    # Anything not in that set is an enclosed hole; restore it ONLY if it's
+    # big enough to plausibly be the item's solid interior. Small holes
+    # are lattice gaps (rope strands, chain links, feather fans) and
+    # filling them adds slot-bg pixels the histogram shouldn't see.
+    min_hole_pixels = int(round(height * width * ITEM_HOLE_MIN_FRACTION))
     interior_hole_mask = np.zeros_like(keep_mask, dtype=bool)
     for label in range(1, num_labels):
-        if label not in border_labels:
-            interior_hole_mask |= (labels == label)
+        if label in border_labels:
+            continue
+        hole = (labels == label)
+        if int(hole.sum()) < min_hole_pixels:
+            continue
+        interior_hole_mask |= hole
 
-    # Keep original outline pixels plus any interior holes we found.
+    # Keep original outline pixels plus any substantial interior holes.
     return keep_mask | interior_hole_mask
+
+
+def _border_connected_background(
+    hsv: np.ndarray,
+    slot_background_bgr: np.ndarray,
+) -> np.ndarray:
+    """Identify slot-bg pixels that are actually "outside" the item.
+
+    Naive HSV matching has a nasty edge case: light-brown or tan item
+    *highlights* (rope fibres, wooden handles) often sit inside the
+    slot-bg HSV envelope and therefore get masked away, leaving the
+    histogram biased toward only the item's dark/shadowed pixels. The
+    reference icon, which has no such masking, ends up much brighter and
+    the Bhattacharyya score collapses.
+
+    Real slot background is always a large area connected to the image
+    border. Item-coloured pixels that happen to match slot-bg's HSV are
+    interior and do NOT connect to the border. So we first compute the
+    naive HSV match and then keep only its border-connected connected
+    components; enclosed bg-coloured regions are returned unmasked.
+
+    (The ``_fill_item_interior`` post-pass still handles the corner case
+    where an item's interior forms a genuine enclosed hole that we do
+    want to keep as part of the item.)
+    """
+    candidate = _is_slot_background_pixel(hsv, slot_background_bgr)
+    if not candidate.any():
+        return candidate
+
+    num_labels, labels = cv2.connectedComponents(candidate.astype(np.uint8))
+    if num_labels <= 1:
+        return candidate
+
+    # Any component touching the outer edge is real slot background; flag
+    # every pixel carrying one of those labels.
+    border_labels = set(labels[0, :].tolist())
+    border_labels.update(labels[-1, :].tolist())
+    border_labels.update(labels[:, 0].tolist())
+    border_labels.update(labels[:, -1].tolist())
+    border_labels.discard(0)  # 0 is the "background" (non-candidate) label
+
+    if not border_labels:
+        return np.zeros_like(candidate)
+
+    label_array = np.arange(num_labels, dtype=np.int32)
+    is_border = np.isin(label_array, list(border_labels))
+    return is_border[labels]
 
 
 def _is_slot_background_pixel(hsv: np.ndarray, slot_background_bgr: np.ndarray) -> np.ndarray:
